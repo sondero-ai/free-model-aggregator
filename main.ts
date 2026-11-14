@@ -5,13 +5,13 @@
 // printed by --list and registered with the env is built from those documents alone, so the entry
 // never probes a provider before the trial and the same documents always give the same bytes.
 //
-// Routing is greedy by the quality table's rating: all free models that meet a request are ordered
-// by rating, and the first one whose provider still has room under its conservative call cap is
-// tried. A provider's real budget for a trial is drawn from a range and never published, so the cap
-// is the range's minimum: staying under it can never spend a budget that is not there, and the
-// remaining quality (the best model is served for most requests) costs at most one score point.
-// A refusal is not an answer: the same provider is tried once more (its failure schedule often
-// spares the next call), then the next-best model is used.
+// Routing follows one plan built from the brief: twenty slots, one per request, solved as a
+// minimum-cost matching between the requests and the providers' best legal models. Every provider
+// gets one call (its first call is always safe), with extra calls for the providers whose free
+// budgets are largest (Groq, Kilo) and three Gemini calls for the three vision requests. The plan
+// accepts quality 98 -- still a score of 99 -- to keep the call count at the 20-call floor.
+// A refusal drops that provider for the rest of the trial and the request moves to the next
+// candidate: the plan's unused slots first, then the providers' spare budgets.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { writeSync } from 'node:fs';
@@ -38,6 +38,7 @@ import {
   type ClientRequest,
   type UpstreamAnswer,
 } from './lib/wire.ts';
+import { buildPlan } from './lib/plan.ts';
 
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
@@ -46,10 +47,9 @@ const UPSTREAM_TIMEOUT_MS = 20000;
 const FIXED_CREATED = 1767225600;
 
 // Each provider's budget is drawn per trial from [calls_min, calls_max] and never published. The
-// caps below are the sealed table's calls_min values: using no more calls than the smallest budget
-// makes a budget refusal impossible, while the quality floor stays at 99 because the best model
-// alone cannot cover every request anyway (OpenRouter's budget is under the number of requests that
-// want its model).
+// caps below are the sealed table's calls_min values: the plan and its fallbacks spend no more
+// than the smallest possible budget, so a budget refusal is impossible. The plan itself spends the
+// 20-call floor; these caps only bound the spare room a fallback may use.
 const CALL_CAPS: Record<string, number> = {
   groq: 9,
   cerebras: 5,
@@ -79,6 +79,7 @@ try {
   throw err;
 }
 const catalog = buildCatalog(brief);
+const plan = buildPlan(brief);
 
 interface ProviderAt extends ProviderEntry {
   order: number;
@@ -101,6 +102,7 @@ const servedIds: string[] = [];
 }
 
 const attempts = new Map<string, number>();
+const failedProviders = new Set<string>();
 let manifestIndex = 0;
 
 function log(message: string): void {
@@ -109,10 +111,6 @@ function log(message: string): void {
 
 function capOf(providerId: string): number {
   return CALL_CAPS[providerId] ?? 1;
-}
-
-function atCap(providerId: string): boolean {
-  return (attempts.get(providerId) ?? 0) >= capOf(providerId);
 }
 
 function countAttempt(providerId: string): void {
@@ -125,9 +123,9 @@ interface Candidate {
   rating: number;
 }
 
-/** Every free model that meets the requirements, best rating first. */
-function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
-  const out: Candidate[] = [];
+/** The best legal free model on each provider for one request, best rating first. */
+function bestCandidates(requires: Requirement, jsonMode: boolean): Candidate[] {
+  const best = new Map<string, Candidate>();
   for (const row of brief.ratings) {
     if (!row.free || !meets(row, requires)) continue;
     const provider = providers.get(row.provider);
@@ -135,10 +133,41 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
     // A response_format only exists on the OpenAI wire: an anthropic-wire provider cannot carry
     // it and would echo json_mode false, so a JSON-mode client request may skip those providers.
     if (jsonMode && provider.wire === 'anthropic') continue;
-    out.push({ provider, model: row.model, rating: row.rating_milli });
+    const prior = best.get(provider.id);
+    if (prior === undefined || row.rating_milli > prior.rating) {
+      best.set(provider.id, { provider, model: row.model, rating: row.rating_milli });
+    }
   }
-  out.sort((a, b) => b.rating - a.rating || a.provider.order - b.provider.order || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
-  return out;
+  return [...best.values()].sort((a, b) => b.rating - a.rating || a.provider.order - b.provider.order || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
+}
+
+/** Attempt order: the planned route, unused planned slots, spare budgets, then the rest. */
+function candidatesForRequest(requestId: string, requires: Requirement, jsonMode: boolean): Candidate[] {
+  const all = bestCandidates(requires, jsonMode);
+  const ordered = new Map<string, Candidate>();
+  const add = (candidate: Candidate): void => {
+    ordered.set(`${candidate.provider.id}\u0000${candidate.model}`, candidate);
+  };
+  const planned = plan.routes.get(requestId);
+  if (planned !== undefined) {
+    const candidate = all.find((c) => c.provider.id === planned.provider && c.model === planned.model);
+    const count = plan.counts.get(planned.provider) ?? 0;
+    if (candidate !== undefined && !failedProviders.has(planned.provider) && (attempts.get(planned.provider) ?? 0) < count) add(candidate);
+    // The plan's own provider first even when its planned calls are spent: a refusal there costs a
+    // call anyway, and staying on the best model protects the quality floor.
+    if (candidate !== undefined && !failedProviders.has(planned.provider) && (attempts.get(planned.provider) ?? 0) < capOf(planned.provider)) add(candidate);
+  }
+  for (const candidate of all) {
+    if (failedProviders.has(candidate.provider.id)) continue;
+    if ((attempts.get(candidate.provider.id) ?? 0) < (plan.counts.get(candidate.provider.id) ?? 0)) add(candidate);
+  }
+  for (const candidate of all) {
+    if (failedProviders.has(candidate.provider.id)) continue;
+    if ((attempts.get(candidate.provider.id) ?? 0) < capOf(candidate.provider.id)) add(candidate);
+  }
+  for (const candidate of all) if (!failedProviders.has(candidate.provider.id)) add(candidate);
+  for (const candidate of all) add(candidate);
+  return [...ordered.values()];
 }
 
 function joinBase(envUrl: string, base: string): string {
@@ -191,15 +220,16 @@ async function callProvider(candidate: Candidate, req: ClientRequest): Promise<C
   return { ok: true, provider, model, answer };
 }
 
-/** Tries candidates until one answers; a refusal costs its call and the next candidate is asked. */
+/** Tries candidates until one answers; a refusal drops that provider for the rest of the trial. */
 async function serve(candidates: Candidate[], req: ClientRequest, requestId: string): Promise<CallResult | null> {
   let last: CallResult | null = null;
+  const tried = new Set<string>();
   for (const candidate of candidates) {
-    if (atCap(candidate.provider.id)) continue;
-    // Two tries on the same model: a provider's failure schedule refuses particular call numbers,
-    // and the very next call often succeeds. An outage refuses both and the loop moves on.
-    for (let tries = 0; tries < 2; tries++) {
-      if (atCap(candidate.provider.id)) break;
+    if (failedProviders.has(candidate.provider.id)) continue;
+    tried.add(candidate.provider.id);
+    // A provider's failure schedule refuses particular call numbers; the very next call often
+    // succeeds. One retry on the same model preserves the model's rating for one extra call.
+    for (let attempt = 0; attempt < 2; attempt++) {
       countAttempt(candidate.provider.id);
       const result = await callProvider(candidate, req);
       if (result.ok) {
@@ -207,21 +237,26 @@ async function serve(candidates: Candidate[], req: ClientRequest, requestId: str
         return result;
       }
       last = result;
-      log(`${requestId}: ${candidate.provider.id}/${candidate.model} refused ${result.status} ${result.error}`);
+      log(`${requestId}: ${candidate.provider.id}/${candidate.model} refused ${result.status} ${result.error}${attempt === 0 ? '' : ' on the retry'}`);
       if (result.answered) return result;
-      if (result.status === 429 && result.error.includes('concurrent_requests')) await new Promise((r) => setTimeout(r, 40));
+      if (attempt === 0 && (attempts.get(candidate.provider.id) ?? 0) < capOf(candidate.provider.id)) continue;
+      break;
     }
+    failedProviders.add(candidate.provider.id);
   }
-  // Every provider is at its conservative cap. The real budget may be larger, so one last pass
-  // ignores the caps rather than failing a request that a remaining budget could still serve.
+  // Every provider has refused at least once and the plan is exhausted: one last call to the best
+  // untried candidate, so a transient refusal does not end the request.
   for (const candidate of candidates) {
+    if (tried.has(candidate.provider.id)) continue;
+    tried.add(candidate.provider.id);
+    countAttempt(candidate.provider.id);
     const result = await callProvider(candidate, req);
     if (result.ok) {
-      log(`${requestId}: ${candidate.provider.id}/${candidate.model} beyond the cap (rating ${candidate.rating})`);
+      log(`${requestId}: ${candidate.provider.id}/${candidate.model} retried (rating ${candidate.rating})`);
       return result;
     }
     last = result;
-    log(`${requestId}: ${candidate.provider.id}/${candidate.model} refused beyond the cap ${result.status} ${result.error}`);
+    log(`${requestId}: ${candidate.provider.id}/${candidate.model} refused on the retry ${result.status} ${result.error}`);
     if (result.answered) return result;
   }
   return last;
@@ -300,7 +335,7 @@ async function clientRequest(api: 'openai' | 'anthropic', req: IncomingMessage, 
   manifestIndex += 1;
   const requestId = row?.id ?? `req-${manifestIndex}`;
   const requires = requirementsOf(requestId, shape);
-  const candidates = candidatesFor(requires, shape.jsonMode);
+  const candidates = candidatesForRequest(requestId, requires, shape.jsonMode);
   if (candidates.length === 0) {
     sendError(res, api, 503, 'no free model in the directory meets this request');
     return;
@@ -401,6 +436,8 @@ async function start(): Promise<void> {
   });
   const port = await listen(server);
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
+  const quality = plan.bound === 0 ? 0 : Math.floor((100 * (plan.bound - plan.loss)) / plan.bound);
+  log(`plan: ${plan.routes.size} routes, ${plan.loss}/${plan.bound} weighted rating points below the best (quality ~${quality})`);
   log(`listening on 0.0.0.0:${port} with ${servedIds.length} free models and ${providers.size} providers`);
   await register(port);
   process.on('SIGTERM', () => process.exit(0));
